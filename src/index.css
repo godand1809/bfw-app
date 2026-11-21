@@ -1,0 +1,94 @@
+/*
+ * src/index.css -- BFT QR Pay design system & print rules
+ * VERSION: 1.0.0 (initial release)
+ *
+ * COLOR SCHEME (single source of truth -- Ben Franklin Transit):
+ *   --blue       #00539b  BFT primary blue (buttons, links, charts)
+ *   --blue-dark  #003a6e  topbar gradient start, headings, KPI figures
+ *   --green      #00843d  success/accepted states, secondary actions
+ *   --yellow     #ffb500  BFT logo square, highlights, stop poster button
+ *   --bg         #f2f5f8  page background
+ *   --card       #ffffff  card surfaces
+ *   --text       #1c2b36  primary text
+ *   --muted      #64748b  secondary text
+ *   --border     #dde5ec  hairline card/table borders
+ *   --danger     #c0392b  rejected/expired/error states
+ *   --ok         #1e8e3e  accepted banners
+ *   --radius     12px     card/button corner radius
+ */
+
+@import "tailwindcss";
+
+:root {
+  --blue: #00539b;
+  --blue-dark: #003a6e;
+  --green: #00843d;
+  --yellow: #ffb500;
+  --bg: #f2f5f8;
+  --card: #ffffff;
+  --text: #1c2b36;
+  --muted: #64748b;
+  --border: #dde5ec;
+  --danger: #c0392b;
+  --ok: #1e8e3e;
+  --radius: 12px;
+}
+
+@layer base {
+  body {
+    margin: 0;
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: "DM Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: "Plus Jakarta Sans", "Segoe UI", system-ui, sans-serif;
+  }
+}
+
+.font-display {
+  font-family: "Plus Jakarta Sans", "Segoe UI", system-ui, sans-serif;
+}
+
+.font-mono-data {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.bft-topbar {
+  background: linear-gradient(90deg, var(--blue-dark), var(--blue));
+}
+
+.bft-qr-img {
+  image-rendering: pixelated;
+}
+
+/* Override html5-qrcode default internal chrome cleanly */
+#qr-reader {
+  border: none !important;
+}
+#qr-reader video {
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+  .print-receipt-card {
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+  }
+}

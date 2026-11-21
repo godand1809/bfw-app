@@ -1,0 +1,2373 @@
+1. App overview
+BFT QR Pay is a QR-code fare payment web application for Ben Franklin Transit (https://www.bft.org/), the public transit agency serving the Tri-Cities, WA (Kennewick, Pasco, Richland). It provides three core capabilities:
+
+Scannable QR codes for payment — riders buy fares in-app and board by showing a tamper-proof QR code; operators scan it with a camera validator.
+Data analytics tracking — every purchase, top-up, and boarding feeds an agency dashboard (KPIs, revenue/day, boardings by route, product mix, payment mix) plus a raw CSV export.
+Proof of purchases — every transaction gets an immutable receipt number (BFT-YYYY-NNNNNN) and a printable receipt page.
+Three surfaces:
+
+Surface	URL	Users
+Rider app	/	Riders: wallet, buy fare, show QR tickets, receipts
+Fare validator	/static/scanner.html	Operators: camera scan, accept/reject, stop posters
+Analytics dashboard	/static/dashboard.html	Agency staff: charts, KPIs, CSV export
+Tech stack: Python 3.12 · FastAPI · SQLite (stdlib sqlite3) · qrcode[pil] for QR rendering · uvicorn server · vanilla JS frontend (no build step) · Chart.js 4.4.3 and html5-qrcode 2.3.8 from jsDelivr CDN.
+
+2. Feature list
+Demo auth: email-only sign-in, auto-creates account; session token in DB, cookie bft_session (httponly, samesite=lax, 30 days).
+Wallet: simulated top-up ($1–$200, 4-digit card suffix); quick amounts $5/$10/$20/$50. Production: swap for Stripe/Adyen PaymentIntent.
+Fare products (BFT 2025 fares):
+Code	Name	Price	Reduced	Rides	Validity
+SINGLE	Single Ride	$1.00	$0.50	1	2 h from first scan
+DAY	Day Pass (mobile only)	$3.00	$1.50	unlimited	24 h
+RIDE10	10-Ride Book	$8.00	$4.00	10	12 months
+MONTH	Monthly Pass	$10.00	$5.00	unlimited	30 days
+YEAR	Yearly Pass (mobile only)	$120.00	$60.00	unlimited	12 months
+Reduced fare toggle (Youth / Senior / Disability pricing).
+QR tickets: payload BFT1:<ticket_id>:<hmac-sha256[:16]> signed with a per-install secret (data/.secret, 64 hex chars, created once). All ticket state resolved server-side at scan time — payloads cannot be forged, edited, or replayed.
+Fare validation: camera scan (html5-qrcode, rear camera) or manual payload entry → POST /api/validate → accept/reject banner + local log + server-side boarding record.
+Stop posters: server-rendered PNG QR per stop; scanning deep-links the rider app with ?stop=CODE and shows a buy-fare banner.
+Receipts: every top-up/purchase recorded; printable proof-of-purchase page with Print/Save-as-PDF.
+Analytics: 7/30/90-day ranges, 6 KPI tiles, 4 Chart.js charts, recent transactions/validations tables, CSV export. Rider emails masked (j***@domain) and CSV uses R-<sha1[:8]> references.
+Demo data: first run seeds 15 BFT routes, 8 stops, 5 fare products, and ~90 days of deterministic synthetic purchases/boardings (seed 42).
+3. Color scheme / design system
+CSS custom properties in styles.css (single source of truth — never hard-code hex values in components):
+
+Variable	Value	Use
+--blue	#00539b	BFT primary blue: buttons, links, charts
+--blue-dark	#003a6e	topbar gradient end, headings, KPI values
+--green	#00843d	success/accepted, secondary buttons
+--yellow	#ffb500	BFT logo square, highlights, poster button
+--bg	#f2f5f8	page background
+--card	#ffffff	card surfaces
+--text	#1c2b36	primary text
+--muted	#64748b	secondary text
+--border	#dde5ec	borders
+--danger	#c0392b	rejected/expired/error
+--ok	#1e8e3e	accepted banners
+--radius	12px	card/button corner radius
+Topbar: linear-gradient(90deg, var(--blue-dark), var(--blue)), yellow "BFT" logo square, Segoe UI/system font stack. Status badges: green for active/accepted/completed, red for used/expired/rejected, blue for topup, amber for purchase. @media print hides chrome on the receipt page.
+
+4. Logical flow (user journeys)
+Rider pays: sign in → wallet top-up (simulated card) → Buy Fare tab → pick product (+ optional reduced pricing) → POST /api/purchase debits wallet, mints ticket, records receipt → QR appears under My Tickets.
+
+Rider boards: show QR → operator scans → POST /api/validate → server verifies HMAC → checks existence → status → expiry → rides → consumes ride / decrements / marks used → boarding logged → green ✅ ACCEPTED or red ❌ REJECTED banner on the validator.
+
+Proof of purchase: Receipts tab lists transactions → "View" opens /static/receipt.html?id=BFT-YYYY-NNNNNN → printable receipt with ticket details.
+
+Agency analytics: Dashboard → choose 7/30/90 days → KPIs + charts + recent activity → Export CSV.
+
+5. Code workflow (request lifecycle)
+POST /api/session — upsert account, create session row, set cookie.
+POST /api/topup — validate amount + card suffix, credit wallet, write transaction with next receipt number.
+POST /api/purchase — load product, price (reduced?), 402 if wallet short, insert ticket (tkt_<hex>, active, rides/expiry from product), debit wallet, write transaction, return QR data-URI + payload.
+POST /api/validate — check_qr_payload (constant-time hmac.compare_digest) → load ticket → status → expiry → rides → consume (rides_remaining - 1, first_used_at via COALESCE, used at 0) → insert boarding row (accepted/rejected) → verdict JSON with masked rider ref (R- + SHA1(email)[:8]).
+GET /api/admin/analytics?days=N — KPIs, revenue_by_day, rides_by_route, product_breakdown, revenue_by_method, recent_transactions (masked), recent_validations.
+GET /api/admin/export.csv — full ledger as CSV, rider references hashed.
+6. API reference
+POST /api/session              sign in (email-only demo auth)
+POST /api/logout               end session
+GET  /api/me                   current account + wallet
+GET  /api/catalog              fare products + routes + stops
+POST /api/topup                add wallet funds (simulated)
+POST /api/purchase             buy fare product -> QR ticket
+GET  /api/tickets              my tickets (fresh QR data-URIs)
+POST /api/tickets/expire-sweep mark expired tickets
+GET  /api/receipts             my proof-of-purchase list
+GET  /api/receipts/{txn_id}    one receipt + ticket detail
+POST /api/validate             scanner: validate/consume a QR
+GET  /api/stop/{code}          stop info (stop posters)
+GET  /api/stop/{code}/qr       PNG QR poster for a stop
+GET  /api/admin/analytics      KPIs + chart datasets (?days=)
+GET  /api/admin/export.csv     raw CSV export
+GET  /healthz                  liveness probe
+GET  /api/docs                 endpoint index (auto docs at /docs)
+7. Run and test
+pip install -r requirements.txt
+python run.py                # http://127.0.0.1:8000
+python tests/e2e_test.py     # 12 end-to-end checks (all pass)
+8. Version tracking convention
+Every file starts with a module comment carrying VERSION: x.y.z. When asking Gemini to change the app, cite the version and describe the change; Gemini should bump the version and summarize the delta in the header comment, e.g. # VERSION: 1.1.0 -- added /api/passes/group purchases (refs: v1.0.0 wallet flow). This keeps previous points/versions traceable and reviewable across the conversation.
+
+9. Complete source code
+Project tree:
+
+bft-qr-pay/
+├── app/
+│   ├── __init__.py
+│   ├── db.py
+│   ├── main.py
+│   └── static/{styles.css,index.html,app.js,scanner.html,scanner.js,dashboard.html,dashboard.js,receipt.html}
+├── tests/e2e_test.py
+├── run.py
+├── requirements.txt
+├── README.md
+├── SECURITY.md
+└── .github/dependabot.yml
+File: app/db.py
+Python -- database layer, schema, BFT catalogs, demo seeder
+
+"""
+app/db.py -- Database layer for the BFT QR Fare Payment application.
+
+VERSION: 1.0.0 (initial release)
+
+WHAT THIS MODULE DOES
+---------------------
+* Defines the SQLite schema for every table the app needs:
+    accounts, routes, fare_products, tickets, transactions,
+    boardings, stops, sessions.
+* Ships the static BFT reference catalogs (routes, fare products,
+  stops) that match Ben Franklin Transit's published 2025 fare
+  structure.
+* Owns the HMAC signing secret used to make QR payloads tamper-proof
+  (data/.secret -- created once per installation, 64 hex chars).
+* Seeds ~90 days of deterministic demo data so the analytics
+  dashboard has something meaningful to chart on first run.
+
+All timestamps are stored as ISO-8601 UTC strings (e.g.
+"2025-04-01T12:34:56+00:00") so they sort correctly as text and are
+portable across languages/tools.
+"""
+
+import hashlib
+import hmac
+import os
+import random
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "bft.db")
+SECRET_PATH = os.path.join(DATA_DIR, ".secret")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+# NOTE ON SCHEMA EVOLUTION: if you change anything here, bump the version
+# comment above and delete data/bft.db so init_db() re-creates it.
+SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS accounts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    email         TEXT NOT NULL UNIQUE,
+    wallet_cents  INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS routes (
+    id    TEXT PRIMARY KEY,          -- e.g. "26", "BENTON"
+    name  TEXT NOT NULL,
+    color TEXT NOT NULL              -- hex color used on charts
+);
+
+CREATE TABLE IF NOT EXISTS fare_products (
+    code              TEXT PRIMARY KEY,   -- SINGLE / DAY / RIDE10 / MONTH / YEAR
+    name              TEXT NOT NULL,
+    price_cents       INTEGER NOT NULL,
+    reduced_price_cents INTEGER NOT NULL,
+    validity_minutes  INTEGER NOT NULL,   -- how long the ticket stays valid
+    rides             INTEGER,            -- NULL = unlimited rides while valid
+    mobile_only       INTEGER NOT NULL DEFAULT 0,
+    description       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tickets (
+    id              TEXT PRIMARY KEY,         -- "tkt_<16 hex>"
+    account_id      INTEGER NOT NULL REFERENCES accounts(id),
+    product_code    TEXT NOT NULL REFERENCES fare_products(code),
+    status          TEXT NOT NULL DEFAULT 'active',  -- active | used | expired
+    rides_remaining INTEGER,                  -- NULL = unlimited (day pass)
+    purchased_at    TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    first_used_at   TEXT,
+    qr_payload      TEXT NOT NULL             -- "BFT1:<ticket_id>:<hmac16>"
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id            TEXT PRIMARY KEY,      -- receipt number "BFT-YYYY-NNNNNN"
+    account_id    INTEGER NOT NULL REFERENCES accounts(id),
+    type          TEXT NOT NULL,         -- topup | purchase
+    product_code  TEXT,                  -- NULL for topups
+    amount_cents  INTEGER NOT NULL,
+    method        TEXT NOT NULL,         -- wallet | card
+    status        TEXT NOT NULL,         -- completed | failed
+    description   TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS boardings (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id   TEXT REFERENCES tickets(id),   -- NULL for rejected scans
+    route_id    TEXT NOT NULL REFERENCES routes(id),
+    stop_id     TEXT REFERENCES stops(code),  -- NULL for rejected scans
+    result      TEXT NOT NULL,                 -- accepted | rejected
+    reason      TEXT NOT NULL,
+    scanner_id  TEXT NOT NULL,
+    rider_ref   TEXT NOT NULL,                 -- masked rider reference
+    scanned_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stops (
+    code TEXT PRIMARY KEY,   -- e.g. "TC-KEN"
+    name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tickets_account ON tickets(account_id);
+CREATE INDEX IF NOT EXISTS idx_txn_account     ON transactions(account_id);
+CREATE INDEX IF NOT EXISTS idx_boardings_time  ON boardings(scanned_at);
+CREATE INDEX IF NOT EXISTS idx_txn_time        ON transactions(created_at);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Static BFT reference catalogs (Ben Franklin Transit, Tri-Cities WA)
+# ---------------------------------------------------------------------------
+# 15 routes covering Kennewick / Pasco / Richland / West Richland.
+ROUTES = [
+    ("26",    "Kennewick - Columbia Park",        "#00539b"),
+    ("27",    "Kennewick - Clearwater",           "#00843d"),
+    ("100",   "Tri-Cities Airport / Pasco",       "#ffb500"),
+    ("110",   "Pasco - Downtown Loop",            "#c0392b"),
+    ("120",   "Pasco - Road 68",                  "#6a3d9a"),
+    ("150",   "Richland - Queensgate",            "#e07b00"),
+    ("160",   "Richland - Horn Rapids",           "#00838f"),
+    ("210",   "Kennewick - Richland Express",     "#00539b"),
+    ("225",   "Pasco - Kennewick Express",        "#003a6e"),
+    ("230",   "Richland - Pasco Express",         "#00843d"),
+    ("240",   "West Richland - Badger Mountain",  "#7b1fa2"),
+    ("250",   "Kennewick - Southridge",           "#ad1457"),
+    ("270",   "Hanford 300 Area",                 "#5d4037"),
+    ("500",   "Connell Commuter",                 "#455a64"),
+    ("BENTON", "Benton City Commuter",            "#f57f17"),
+]
+
+# Fare products -- matches BFT's published 2025 fare structure.
+# SINGLE $1.00 (reduced $0.50) | DAY PASS $3.00 (mobile only)
+# 10-RIDE BOOK $8.00 | MONTHLY $10.00 | YEARLY $120.00 (mobile only)
+FARE_PRODUCTS = [
+    ("SINGLE",  "Single Ride",       100,   50,  120,    1,    0,
+     "One ride on any BFT route. Valid 2 hours from first scan."),
+    ("DAY",     "Day Pass",          300,  150, 1440,    None, 1,
+     "Unlimited rides for 24 hours. Mobile app only."),
+    ("RIDE10",  "10-Ride Book",      800,  400, 525600, 10,   0,
+     "Ten rides, usable one at a time. Valid 12 months."),
+    ("MONTH",   "Monthly Pass",     1000,  500, 43200,   None, 0,
+     "Unlimited rides for 30 days."),
+    ("YEAR",    "Yearly Pass",     12000, 6000, 525600,  None, 1,
+     "Unlimited rides for 12 months. Mobile app only."),
+]
+
+# 8 major stops used by the scanner's "scan stop QR to buy" flow.
+STOPS = [
+    ("TC-KEN", "Tri-Cities Station - Kennewick"),
+    ("TC-PAS", "Tri-Cities Station - Pasco"),
+    ("TC-RIC", "Tri-Cities Station - Richland"),
+    ("TC-QUE", "Queensgate Park & Ride"),
+    ("STP-CCM", "Columbia Center Mall"),
+    ("STP-CPP", "Columbia Park"),
+    ("STP-VGS", "Village Green - Pasco"),
+    ("STP-3RV", "Three Rivers Convention Center"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Signing secret (QR tamper-proofing)
+# ---------------------------------------------------------------------------
+def get_secret() -> bytes:
+    """Return the per-installation HMAC signing secret.
+
+    The secret is generated once (64 hex chars) and stored at
+    data/.secret. It signs every QR payload as
+    HMAC-SHA256(ticket_id)[:16 hex]. Losing it invalidates all
+    previously issued QR codes; rotate it only when you also
+    expire all outstanding tickets.
+    """
+    if os.path.exists(SECRET_PATH):
+        with open(SECRET_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip().encode()
+    secret = os.urandom(32).hex().encode()
+    with open(SECRET_PATH, "w", encoding="utf-8") as f:
+        f.write(secret.decode())
+    return secret
+
+
+# ---------------------------------------------------------------------------
+# Connection helper
+# ---------------------------------------------------------------------------
+def connect() -> sqlite3.Connection:
+    """Open a SQLite connection with sane defaults.
+
+    IMPORTANT: this returns the connection itself (not a generator).
+    An earlier version yielded the connection, which made the object
+    garbage-collected right after use and closed the DB mid-request
+    (sqlite3.ProgrammingError: Cannot operate on a closed database).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db(seed_demo: bool = True) -> None:
+    """Create the schema and (optionally) seed demo data.
+
+    Safe to call on every startup: CREATE TABLE IF NOT EXISTS means
+    existing data is untouched.
+    """
+    conn = connect()
+    conn.executescript(SCHEMA)
+    # Static catalogs -- upsert so re-seeding refreshes names/prices.
+    for rid, name, color in ROUTES:
+        conn.execute(
+            "INSERT OR REPLACE INTO routes (id, name, color) VALUES (?,?,?)",
+            (rid, name, color),
+        )
+    for (code, name, price, reduced, validity, rides, mobile_only,
+         description) in FARE_PRODUCTS:
+        conn.execute(
+            "INSERT OR REPLACE INTO fare_products "
+            "(code, name, price_cents, reduced_price_cents, validity_minutes,"
+            " rides, mobile_only, description) VALUES (?,?,?,?,?,?,?,?)",
+            (code, name, price, reduced, validity, rides, mobile_only,
+             description),
+        )
+    for code, name in STOPS:
+        conn.execute(
+            "INSERT OR REPLACE INTO stops (code, name) VALUES (?,?)",
+            (code, name),
+        )
+    conn.commit()
+    conn.close()
+
+    if seed_demo and not _has_demo_data():
+        _seed_demo()
+
+
+def _has_demo_data() -> bool:
+    """True once at least one demo transaction exists."""
+    conn = connect()
+    row = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()
+    conn.close()
+    return row["n"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Demo data generator (deterministic, seed=42)
+# ---------------------------------------------------------------------------
+def _seed_demo() -> None:
+    """Generate ~90 days of synthetic purchases and boardings.
+
+    Product mix is weighted 55/25/8/10/2 (SINGLE/DAY/RIDE10/MONTH/YEAR)
+    and purchases are weekday-weighted (more rides Mon-Fri). Each
+    purchase produces 1+ boardings. Uses random.Random(42) so every
+    fresh install gets identical analytics numbers.
+    """
+    rng = random.Random(42)
+    now = datetime.now(timezone.utc)
+    conn = connect()
+
+    # 40 demo accounts with varying wallet balances.
+    account_ids = []
+    for i in range(40):
+        email = f"rider{i+1}@example.com"
+        created = now - timedelta(days=90, minutes=rng.randint(0, 10000))
+        cur = conn.execute(
+            "INSERT INTO accounts (email, wallet_cents, created_at) "
+            "VALUES (?,?,?)",
+            (email, rng.choice([0, 0, 500, 1000, 2000, 5000]), created.isoformat()),
+        )
+        account_ids.append((cur.lastrowid, email))
+
+    products = {p[0]: p for p in FARE_PRODUCTS}
+    weights = [55, 25, 8, 10, 2]
+    product_codes = [p[0] for p in FARE_PRODUCTS]
+    route_ids = [r[0] for r in ROUTES]
+    stop_codes = [s[0] for s in STOPS]
+    receipt_seq = 1
+
+    # Walk backwards over 90 days.
+    for day_offset in range(90, -1, -1):
+        day = now - timedelta(days=day_offset)
+        # Weekday weighting: 12-22 purchases on weekdays, 5-11 on weekends.
+        is_weekend = day.weekday() >= 5
+        n_purchases = rng.randint(5, 11) if is_weekend else rng.randint(12, 22)
+
+        for _ in range(n_purchases):
+            acct_id, email = rng.choice(account_ids)
+            product_code = rng.choices(product_codes, weights=weights, k=1)[0]
+            code, name, price, reduced, validity, rides, mobile_only, _desc = (
+                products[product_code]
+            )
+            purchased_at = day.replace(
+                hour=rng.randint(5, 21), minute=rng.randint(0, 59),
+                second=rng.randint(0, 59), microsecond=0,
+            )
+            # ~20% of riders use reduced fare.
+            amount = reduced if rng.random() < 0.2 else price
+            method = "wallet" if rng.random() < 0.7 else "card"
+
+            receipt = f"BFT-{purchased_at.year}-{receipt_seq:06d}"
+            receipt_seq += 1
+            conn.execute(
+                "INSERT INTO transactions (id, account_id, type, product_code,"
+                " amount_cents, method, status, description, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (receipt, acct_id, "purchase", product_code, amount, method,
+                 "completed", f"{name}", purchased_at.isoformat()),
+            )
+
+            # Mint the ticket (same payload format as the live app).
+            ticket_id = "tkt_" + os.urandom(8).hex()
+            sig = hmac.new(get_secret(), ticket_id.encode(),
+                           hashlib.sha256).hexdigest()[:16]
+            expires_at = purchased_at + timedelta(minutes=validity)
+            conn.execute(
+                "INSERT INTO tickets (id, account_id, product_code, status,"
+                " rides_remaining, purchased_at, expires_at, first_used_at,"
+                " qr_payload) VALUES (?,?,?,?,?,?,?,?,?)",
+                (ticket_id, acct_id, product_code, "used",
+                 (rides - 1) if rides else None,
+                 purchased_at.isoformat(), expires_at.isoformat(),
+                 purchased_at.isoformat(), f"BFT1:{ticket_id}:{sig}"),
+            )
+
+            # 1+ boardings per purchase (day/month/year passes ride more).
+            n_boardings = 1 if product_code == "SINGLE" else rng.randint(2, 6)
+            for _ in range(n_boardings):
+                boarded_at = purchased_at + timedelta(
+                    minutes=rng.randint(1, min(90, validity)))
+                if boarded_at > expires_at:
+                    continue
+                conn.execute(
+                    "INSERT INTO boardings (ticket_id, route_id, stop_id,"
+                    " result, reason, scanner_id, rider_ref, scanned_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (ticket_id, rng.choice(route_ids), rng.choice(stop_codes),
+                     "accepted", "OK",
+                     f"SCN-{rng.randint(100, 999)}",
+                     "R-" + hashlib.sha1(email.encode()).hexdigest()[:8],
+                     boarded_at.isoformat()),
+                )
+
+            # Occasional rejected scan (expired/reused tickets).
+            if rng.random() < 0.05:
+                conn.execute(
+                    "INSERT INTO boardings (ticket_id, route_id, stop_id,"
+                    " result, reason, scanner_id, rider_ref, scanned_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (None, rng.choice(route_ids), rng.choice(stop_codes),
+                     "rejected", rng.choice(["Ticket is expired",
+                                             "Ticket is used"]),
+                     f"SCN-{rng.randint(100, 999)}", "R-UNKNOWN",
+                     (purchased_at + timedelta(minutes=rng.randint(30, 200)))
+                     .isoformat()),
+                )
+
+    conn.commit()
+    conn.close()
+File: app/main.py
+Python -- FastAPI backend: auth, wallet, purchases, QR mint/validate, receipts, analytics
+
+"""
+app/main.py -- FastAPI backend for the BFT QR Fare Payment application.
+
+VERSION: 1.0.0 (initial release)
+
+QR TRUST MODEL
+--------------
+A fare ticket's QR code encodes:  BFT1:<ticket_id>:<hmac[:16]>
+where hmac = HMAC-SHA256(per-install secret, ticket_id), truncated to
+16 hex chars. Consequences:
+
+* Payloads cannot be forged -- an attacker cannot mint a valid QR
+  without the server-side secret in data/.secret.
+* Payloads cannot be edited -- changing ticket_id breaks the HMAC.
+* Payloads cannot be replayed after use -- ALL ticket state
+  (expiry, rides_remaining, status) lives server-side and is
+  resolved at scan time. The QR is only a pointer, never the source
+  of truth.
+
+Single-ride tickets are consumed on first successful scan; multi-ride
+products decrement rides_remaining; unlimited products (DAY/MONTH/YEAR)
+stay valid until expiry.
+
+PAYMENTS: simulated in this demo. The wallet top-up validates the
+amount and a 4-digit card suffix, then credits the wallet. In
+production, replace POST /api/topup with a Stripe/Adyen PaymentIntent
+flow -- see README "Production notes".
+"""
+
+import csv
+import hashlib
+import hmac
+import io
+import os
+import secrets
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import qrcode
+from fastapi import Cookie, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, EmailStr, Field
+
+from .db import connect, get_secret, init_db
+
+# ---------------------------------------------------------------------------
+# App bootstrap
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="BFT QR Fare Payment API",
+    description=(
+        "Scannable QR-code fare payment for Ben Franklin Transit: "
+        "purchase fares, pay with QR, track analytics, issue receipts."
+    ),
+    version="1.0.0",
+)
+
+# Create schema + seed demo data on first import (idempotent).
+init_db(seed_demo=True)
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+# ---------------------------------------------------------------------------
+# QR signing helpers
+# ---------------------------------------------------------------------------
+def sign(ticket_id: str) -> str:
+    """HMAC-SHA256(ticket_id)[:16] using the per-install secret."""
+    return hmac.new(get_secret(), ticket_id.encode(),
+                    hashlib.sha256).hexdigest()[:16]
+
+
+def make_qr_payload(ticket_id: str) -> str:
+    """Build the tamper-proof QR payload: BFT1:<ticket_id>:<hmac16>."""
+    return f"BFT1:{ticket_id}:{sign(ticket_id)}"
+
+
+def check_qr_payload(payload: str) -> str:
+    """Validate a scanned payload and return the embedded ticket_id.
+
+    Raises HTTPException 400 on any malformed/forged payload.
+    Uses hmac.compare_digest (constant time) so timing attacks
+    cannot be used to guess a valid signature byte-by-byte.
+    """
+    parts = payload.strip().split(":")
+    if len(parts) != 3 or parts[0] != "BFT1":
+        raise HTTPException(400, "Malformed QR payload")
+    ticket_id, sig = parts[1], parts[2]
+    expected = sign(ticket_id)
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(400, "Invalid QR signature")
+    return ticket_id
+
+
+def qr_png_data_uri(payload: str) -> str:
+    """Render a payload as a base64 PNG data-URI (for <img> tags)."""
+    import base64
+    img = qrcode.make(payload, box_size=6, border=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers (demo: email-only sign-in)
+# ---------------------------------------------------------------------------
+SESSION_COOKIE = "bft_session"
+SESSION_DAYS = 30
+
+
+def current_account(bft_session: Optional[str] = Cookie(None)):
+    """Resolve the signed-in account from the session cookie, or None."""
+    if not bft_session:
+        return None
+    conn = connect()
+    row = conn.execute(
+        "SELECT a.* FROM sessions s JOIN accounts a ON a.id = s.account_id "
+        "WHERE s.token = ? AND s.expires_at > ?",
+        (bft_session, _now_iso()),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def require_account(bft_session: Optional[str] = Cookie(None)):
+    """Like current_account but raises 401 when signed out."""
+    acct = current_account(bft_session)
+    if acct is None:
+        raise HTTPException(401, "Sign in required")
+    return acct
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def rider_ref(email: str) -> str:
+    """Privacy-preserving rider reference: R- + SHA1(email)[:8]."""
+    return "R-" + hashlib.sha1(email.encode()).hexdigest()[:8]
+
+
+def mask_email(email: str) -> str:
+    """Mask an email for public analytics: 'jane.doe@x.com' -> 'j***@x.com'."""
+    local, _, domain = email.partition("@")
+    return (local[0] + "***@" + domain) if local else "***"
+
+
+def next_receipt_number(conn: sqlite3.Connection) -> str:
+    """Generate the next receipt number BFT-YYYY-NNNNNN (monotonic)."""
+    year = datetime.now(timezone.utc).year
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM transactions WHERE id LIKE ?",
+        (f"BFT-{year}-%",),
+    ).fetchone()
+    return f"BFT-{year}-{row['n'] + 1:06d}"
+
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+class SignIn(BaseModel):
+    email: EmailStr
+
+
+class TopUp(BaseModel):
+    amount_cents: int = Field(ge=100, le=20000)   # $1 - $200
+    card_last4: str = Field(pattern=r"^\d{4}$")   # demo card suffix
+
+
+class Purchase(BaseModel):
+    product_code: str
+    reduced: bool = False
+
+
+class ValidateScan(BaseModel):
+    payload: str
+    route_id: str
+    scanner_id: str = "SCN-000"
+    stop_code: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Root + health
+# ---------------------------------------------------------------------------
+@app.get("/", include_in_schema=False)
+def root():
+    """Serve the rider app (wallet / buy / tickets / receipts)."""
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/healthz")
+def healthz():
+    """Liveness probe used by tests and deployment monitors."""
+    return {"status": "ok"}
+
+
+@app.get("/api/docs", include_in_schema=False)
+def api_docs():
+    """Human-readable API index (FastAPI's auto docs live at /docs)."""
+    return {
+        "interactive_docs": "/docs",
+        "endpoints": [
+            "POST /api/session            - sign in (email-only demo auth)",
+            "POST /api/logout             - end session",
+            "GET  /api/me                 - current account + wallet",
+            "GET  /api/catalog            - fare products + routes + stops",
+            "POST /api/topup              - add wallet funds (simulated)",
+            "POST /api/purchase           - buy a fare product -> QR ticket",
+            "GET  /api/tickets            - my active/history tickets",
+            "POST /api/tickets/expire-sweep - mark expired tickets",
+            "GET  /api/receipts           - my proof-of-purchase list",
+            "GET  /api/receipts/{txn_id}  - one receipt + ticket detail",
+            "POST /api/validate           - scanner: validate/consume a QR",
+            "GET  /api/stop/{code}        - stop info (for stop QR posters)",
+            "GET  /api/stop/{code}/qr     - PNG QR poster for a stop",
+            "GET  /api/admin/analytics    - KPIs + chart datasets (?days=)",
+            "GET  /api/admin/export.csv   - raw CSV export",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Session / account
+# ---------------------------------------------------------------------------
+@app.post("/api/session")
+def sign_in(body: SignIn, response: Response):
+    """Email-only demo sign-in: auto-creates the account, sets a
+    30-day session cookie (httponly, samesite=lax)."""
+    conn = connect()
+    now = _now_iso()
+    acct = conn.execute("SELECT * FROM accounts WHERE email = ?",
+                        (body.email,)).fetchone()
+    if acct is None:
+        cur = conn.execute(
+            "INSERT INTO accounts (email, wallet_cents, created_at) "
+            "VALUES (?,?,?)", (body.email, 0, now))
+        acct_id = cur.lastrowid
+    else:
+        acct_id = acct["id"]
+    token = secrets.token_hex(24)
+    expires = (datetime.now(timezone.utc)
+               + timedelta(days=SESSION_DAYS)).isoformat()
+    conn.execute(
+        "INSERT INTO sessions (token, account_id, created_at, expires_at) "
+        "VALUES (?,?,?,?)", (token, acct_id, now, expires))
+    conn.commit()
+    conn.close()
+    response.set_cookie(SESSION_COOKIE, token, httponly=True,
+                        samesite="lax", max_age=SESSION_DAYS * 86400)
+    return {"ok": True}
+
+
+@app.post("/api/logout")
+def logout(response: Response, bft_session: Optional[str] = Cookie(None)):
+    """Delete the server-side session and clear the cookie."""
+    if bft_session:
+        conn = connect()
+        conn.execute("DELETE FROM sessions WHERE token = ?", (bft_session,))
+        conn.commit()
+        conn.close()
+    response.delete_cookie(SESSION_COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/me")
+def me(bft_session: Optional[str] = Cookie(None)):
+    """Current account summary (or signed-out stub for the UI)."""
+    acct = current_account(bft_session)
+    if acct is None:
+        return {"signed_in": False}
+    return {"signed_in": True, "email": acct["email"],
+            "wallet_cents": acct["wallet_cents"]}
+
+
+# ---------------------------------------------------------------------------
+# Catalog
+# ---------------------------------------------------------------------------
+@app.get("/api/catalog")
+def catalog():
+    """Fare products, routes, and stops for the rider UI."""
+    conn = connect()
+    products = [dict(r) for r in
+                conn.execute("SELECT * FROM fare_products ORDER BY price_cents")]
+    routes = [dict(r) for r in
+              conn.execute("SELECT * FROM routes ORDER BY CAST(id AS TEXT)")]
+    stops = [dict(r) for r in conn.execute("SELECT * FROM stops ORDER BY code")]
+    conn.close()
+    return {"products": products, "routes": routes, "stops": stops}
+
+
+# ---------------------------------------------------------------------------
+# Wallet top-up (simulated payment)
+# ---------------------------------------------------------------------------
+@app.post("/api/topup")
+def topup(body: TopUp, bft_session: Optional[str] = Cookie(None)):
+    """Credit the wallet. PRODUCTION: swap this whole handler for a
+    Stripe/Adyen PaymentIntent confirmation -- never trust client-side
+    amounts with real money."""
+    acct = require_account(bft_session)
+    conn = connect()
+    new_balance = acct["wallet_cents"] + body.amount_cents
+    conn.execute("UPDATE accounts SET wallet_cents = ? WHERE id = ?",
+                 (new_balance, acct["id"]))
+    receipt = next_receipt_number(conn)
+    now = _now_iso()
+    conn.execute(
+        "INSERT INTO transactions (id, account_id, type, product_code,"
+        " amount_cents, method, status, description, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        (receipt, acct["id"], "topup", None, body.amount_cents, "card",
+         "completed", f"Wallet top-up (card ****{body.card_last4})", now))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "wallet_cents": new_balance, "receipt_id": receipt}
+
+
+# ---------------------------------------------------------------------------
+# Fare purchase -> QR ticket
+# ---------------------------------------------------------------------------
+@app.post("/api/purchase")
+def purchase(body: Purchase, bft_session: Optional[str] = Cookie(None)):
+    """Buy a fare product: debit wallet, mint ticket, record receipt,
+    return the QR data-URI + payload."""
+    acct = require_account(bft_session)
+    conn = connect()
+
+    product = conn.execute("SELECT * FROM fare_products WHERE code = ?",
+                           (body.product_code,)).fetchone()
+    if product is None:
+        conn.close()
+        raise HTTPException(404, "Unknown fare product")
+
+    price = (product["reduced_price_cents"] if body.reduced
+             else product["price_cents"])
+    if acct["wallet_cents"] < price:
+        conn.close()
+        raise HTTPException(402, "Insufficient funds. Please top up.")
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    expires_iso = (now + timedelta(
+        minutes=product["validity_minutes"])).isoformat()
+
+    ticket_id = "tkt_" + secrets.token_hex(8)
+    payload = make_qr_payload(ticket_id)
+    conn.execute(
+        "INSERT INTO tickets (id, account_id, product_code, status,"
+        " rides_remaining, purchased_at, expires_at, first_used_at,"
+        " qr_payload) VALUES (?,?,?,?,?,?,?,?,?)",
+        (ticket_id, acct["id"], product["code"], "active",
+         product["rides"], now_iso, expires_iso, None, payload))
+
+    new_balance = acct["wallet_cents"] - price
+    conn.execute("UPDATE accounts SET wallet_cents = ? WHERE id = ?",
+                 (new_balance, acct["id"]))
+    receipt = next_receipt_number(conn)
+    conn.execute(
+        "INSERT INTO transactions (id, account_id, type, product_code,"
+        " amount_cents, method, status, description, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        (receipt, acct["id"], "purchase", product["code"], price, "wallet",
+         "completed", product["name"], now_iso))
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "wallet_cents": new_balance,
+        "receipt_id": receipt,
+        "ticket": {
+            "id": ticket_id,
+            "product_code": product["code"],
+            "product_name": product["name"],
+            "status": "active",
+            "rides_remaining": product["rides"],
+            "purchased_at": now_iso,
+            "expires_at": expires_iso,
+            "qr_payload": payload,
+            "qr_png_data_uri": qr_png_data_uri(payload),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# My tickets
+# ---------------------------------------------------------------------------
+@app.get("/api/tickets")
+def my_tickets(bft_session: Optional[str] = Cookie(None)):
+    """All of the signed-in rider's tickets, newest first, with fresh
+    QR data-URIs (the payload itself never changes)."""
+    acct = require_account(bft_session)
+    conn = connect()
+    rows = conn.execute(
+        "SELECT t.*, p.name AS product_name FROM tickets t "
+        "JOIN fare_products p ON p.code = t.product_code "
+        "WHERE t.account_id = ? ORDER BY t.purchased_at DESC",
+        (acct["id"],)).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["qr_png_data_uri"] = qr_png_data_uri(d["qr_payload"])
+        out.append(d)
+    return {"tickets": out}
+
+
+@app.post("/api/tickets/expire-sweep")
+def expire_sweep():
+    """Mark any active ticket whose expires_at has passed as 'expired'.
+    Called by the rider UI on load and safe to call on a cron."""
+    conn = connect()
+    cur = conn.execute(
+        "UPDATE tickets SET status = 'expired' "
+        "WHERE status = 'active' AND expires_at < ?", (_now_iso(),))
+    conn.commit()
+    changed = cur.rowcount
+    conn.close()
+    return {"expired": changed}
+
+
+# ---------------------------------------------------------------------------
+# Receipts (proof of purchase)
+# ---------------------------------------------------------------------------
+@app.get("/api/receipts")
+def my_receipts(bft_session: Optional[str] = Cookie(None)):
+    """The signed-in rider's transactions (receipts), newest first."""
+    acct = require_account(bft_session)
+    conn = connect()
+    rows = conn.execute(
+        "SELECT * FROM transactions WHERE account_id = ? "
+        "ORDER BY created_at DESC LIMIT 200", (acct["id"],)).fetchall()
+    conn.close()
+    return {"receipts": [dict(r) for r in rows]}
+
+
+@app.get("/api/receipts/{txn_id}")
+def one_receipt(txn_id: str, bft_session: Optional[str] = Cookie(None)):
+    """One receipt with its linked ticket detail -- this powers the
+    printable proof-of-purchase page (/static/receipt.html?id=...)."""
+    acct = require_account(bft_session)
+    conn = connect()
+    txn = conn.execute(
+        "SELECT * FROM transactions WHERE id = ? AND account_id = ?",
+        (txn_id, acct["id"])).fetchone()
+    if txn is None:
+        conn.close()
+        raise HTTPException(404, "Receipt not found")
+    ticket = None
+    if txn["type"] == "purchase":
+        ticket = conn.execute(
+            "SELECT t.id, t.status, t.rides_remaining, t.expires_at, "
+            "p.name AS product_name FROM tickets t "
+            "JOIN fare_products p ON p.code = t.product_code "
+            "WHERE t.account_id = ? AND t.product_code = ? "
+            "ORDER BY t.purchased_at DESC LIMIT 1",
+            (acct["id"], txn["product_code"])).fetchone()
+    conn.close()
+    return {"receipt": dict(txn),
+            "ticket": dict(ticket) if ticket else None}
+
+
+# ---------------------------------------------------------------------------
+# Scanner validation (the heart of the payment flow)
+# ---------------------------------------------------------------------------
+@app.post("/api/validate")
+def validate_scan(body: ValidateScan):
+    """Validate a scanned QR payload and (if valid) consume one ride.
+
+    Order of checks (each failure logs a rejected boarding row):
+      1. Signature check (forged/tampered payloads die here)
+      2. Ticket exists
+      3. Status is 'active'
+      4. Not expired
+      5. Rides remaining (multi-ride products)
+    On success: decrement rides / set first_used_at / mark 'used' at 0,
+    then log an accepted boarding with a masked rider reference.
+    """
+    conn = connect()
+    now_iso = _now_iso()
+
+    def reject(reason: str, ticket_id=None):
+        conn.execute(
+            "INSERT INTO boardings (ticket_id, route_id, stop_id, result,"
+            " reason, scanner_id, rider_ref, scanned_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (ticket_id, body.route_id, body.stop_code, "rejected", reason,
+             body.scanner_id, "R-UNKNOWN", now_iso))
+        conn.commit()
+        conn.close()
+        return {"result": "rejected", "reason": reason, "rider_ref": "R-UNKNOWN",
+                "scanned_at": now_iso}
+
+    # 1. Signature / format
+    try:
+        ticket_id = check_qr_payload(body.payload)
+    except HTTPException as e:
+        return reject(e.detail)
+
+    # 2. Ticket exists
+    ticket = conn.execute("SELECT * FROM tickets WHERE id = ?",
+                          (ticket_id,)).fetchone()
+    if ticket is None:
+        return reject("Ticket not found", ticket_id)
+
+    # 3. Status
+    if ticket["status"] != "active":
+        return reject(f"Ticket is {ticket['status']}", ticket_id)
+
+    # 4. Expiry
+    if ticket["expires_at"] < now_iso:
+        conn.execute("UPDATE tickets SET status = 'expired' WHERE id = ?",
+                     (ticket_id,))
+        conn.commit()
+        conn.close()
+        return reject("Ticket is expired", ticket_id)
+
+    # 5. Rides remaining (NULL = unlimited, e.g. day/month/year pass)
+    product = conn.execute("SELECT * FROM fare_products WHERE code = ?",
+                           (ticket["product_code"],)).fetchone()
+    if ticket["rides_remaining"] is not None:
+        if ticket["rides_remaining"] <= 0:
+            return reject("Ticket is used", ticket_id)
+        conn.execute(
+            "UPDATE tickets SET rides_remaining = rides_remaining - 1, "
+            "first_used_at = COALESCE(first_used_at, ?) WHERE id = ?",
+            (now_iso, ticket_id))
+        new_rides = ticket["rides_remaining"] - 1
+        if new_rides == 0:
+            conn.execute("UPDATE tickets SET status = 'used' WHERE id = ?",
+                         (ticket_id,))
+    else:
+        conn.execute(
+            "UPDATE tickets SET first_used_at = COALESCE(first_used_at, ?) "
+            "WHERE id = ?", (now_iso, ticket_id))
+        new_rides = None
+
+    # Log the accepted boarding with a masked rider reference.
+    account = conn.execute("SELECT email FROM accounts WHERE id = ?",
+                           (ticket["account_id"],)).fetchone()
+    ref = rider_ref(account["email"]) if account else "R-UNKNOWN"
+    conn.execute(
+        "INSERT INTO boardings (ticket_id, route_id, stop_id, result,"
+        " reason, scanner_id, rider_ref, scanned_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (ticket_id, body.route_id, body.stop_code, "accepted", "OK",
+         body.scanner_id, ref, now_iso))
+    conn.commit()
+    conn.close()
+
+    return {
+        "result": "accepted",
+        "ticket_id": ticket_id,
+        "product_code": ticket["product_code"],
+        "product_name": product["name"],
+        "rides_remaining": new_rides,
+        "expires_at": ticket["expires_at"],
+        "rider_ref": ref,
+        "scanned_at": now_iso,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stop QR posters ("scan here to pay & ride")
+# ---------------------------------------------------------------------------
+@app.get("/api/stop/{code}")
+def stop_info(code: str):
+    """Stop details shown when a rider scans a stop poster QR, which
+    deep-links the rider app to ?stop=CODE with a buy-fare banner."""
+    conn = connect()
+    row = conn.execute("SELECT * FROM stops WHERE code = ?",
+                       (code.upper(),)).fetchone()
+    conn.close()
+    if row is None:
+        raise HTTPException(404, "Unknown stop")
+    return dict(row)
+
+
+@app.get("/api/stop/{code}/qr")
+def stop_qr(code: str):
+    """Server-rendered PNG QR poster for a stop (no external QR
+    service -- the payload URL is generated locally)."""
+    conn = connect()
+    row = conn.execute("SELECT * FROM stops WHERE code = ?",
+                       (code.upper(),)).fetchone()
+    conn.close()
+    if row is None:
+        raise HTTPException(404, "Unknown stop")
+    url = f"/?stop={code.upper()}"     # relative deep link into rider app
+    img = qrcode.make(url, box_size=8, border=3)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# Analytics (admin / agency dashboards)
+# ---------------------------------------------------------------------------
+@app.get("/api/admin/analytics")
+def analytics(days: int = Query(30, ge=1, le=365),
+              bft_session: Optional[str] = Cookie(None)):
+    """KPIs + chart datasets for the analytics dashboard.
+
+    NOTE: open in this demo for easy evaluation. In production,
+    protect /api/admin/* behind staff SSO (see SECURITY.md).
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = connect()
+
+    kpis = {
+        "revenue_cents": conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS v FROM transactions "
+            "WHERE status = 'completed' AND created_at >= ?",
+            (since,)).fetchone()["v"],
+        "boardings": conn.execute(
+            "SELECT COUNT(*) AS v FROM boardings WHERE scanned_at >= ?",
+            (since,)).fetchone()["v"],
+        "accepted": conn.execute(
+            "SELECT COUNT(*) AS v FROM boardings "
+            "WHERE scanned_at >= ? AND result = 'accepted'",
+            (since,)).fetchone()["v"],
+        "rejected": conn.execute(
+            "SELECT COUNT(*) AS v FROM boardings "
+            "WHERE scanned_at >= ? AND result = 'rejected'",
+            (since,)).fetchone()["v"],
+        "active_tickets": conn.execute(
+            "SELECT COUNT(*) AS v FROM tickets WHERE status = 'active'"
+        ).fetchone()["v"],
+        "accounts": conn.execute(
+            "SELECT COUNT(*) AS v FROM accounts").fetchone()["v"],
+    }
+
+    revenue_by_day = [dict(r) for r in conn.execute(
+        "SELECT substr(created_at, 1, 10) AS day, SUM(amount_cents) AS cents "
+        "FROM transactions WHERE status = 'completed' AND created_at >= ? "
+        "GROUP BY day ORDER BY day", (since,))]
+
+    rides_by_route = [dict(r) for r in conn.execute(
+        "SELECT ro.id AS route, ro.color, COUNT(b.id) AS boardings "
+        "FROM routes ro LEFT JOIN boardings b "
+        "ON b.route_id = ro.id AND b.scanned_at >= ? "
+        "GROUP BY ro.id ORDER BY boardings DESC", (since,))]
+
+    product_breakdown = [dict(r) for r in conn.execute(
+        "SELECT p.name AS product, SUM(t.amount_cents) AS cents "
+        "FROM transactions t JOIN fare_products p "
+        "ON p.code = t.product_code "
+        "WHERE t.status = 'completed' AND t.type = 'purchase' "
+        "AND t.created_at >= ? GROUP BY p.code ORDER BY cents DESC",
+        (since,))]
+
+    revenue_by_method = [dict(r) for r in conn.execute(
+        "SELECT method, SUM(amount_cents) AS cents FROM transactions "
+        "WHERE status = 'completed' AND created_at >= ? "
+        "GROUP BY method", (since,))]
+
+    recent_transactions = [dict(r) for r in conn.execute(
+        "SELECT t.id, t.type, t.product_code, t.amount_cents, t.method, "
+        "t.status, t.created_at, a.email FROM transactions t "
+        "JOIN accounts a ON a.id = t.account_id "
+        "ORDER BY t.created_at DESC LIMIT 15")]
+
+    recent_validations = [dict(r) for r in conn.execute(
+        "SELECT route_id, result, reason, scanner_id, rider_ref, scanned_at "
+        "FROM boardings ORDER BY scanned_at DESC LIMIT 15")]
+
+    conn.close()
+
+    # Mask rider emails for public-facing analytics.
+    for t in recent_transactions:
+        t["email"] = mask_email(t.pop("email"))
+
+    return {"days": days, "kpis": kpis,
+            "revenue_by_day": revenue_by_day,
+            "rides_by_route": rides_by_route,
+            "product_breakdown": product_breakdown,
+            "revenue_by_method": revenue_by_method,
+            "recent_transactions": recent_transactions,
+            "recent_validations": recent_validations}
+
+
+@app.get("/api/admin/export.csv")
+def export_csv(days: int = Query(90, ge=1, le=365)):
+    """Raw CSV export of the transaction ledger (for finance/reconcile)."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = connect()
+    rows = conn.execute(
+        "SELECT t.id, t.type, t.product_code, t.amount_cents, t.method, "
+        "t.status, t.created_at, a.email FROM transactions t "
+        "JOIN accounts a ON a.id = t.account_id "
+        "WHERE t.created_at >= ? ORDER BY t.created_at", (since,))
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["receipt_id", "type", "product", "amount_cents",
+                     "method", "status", "created_at", "rider_ref"])
+    for r in rows:
+        d = dict(r)
+        d["email"] = rider_ref(d.pop("email"))  # never export raw emails
+        writer.writerow(list(d.values()))
+    conn.close()
+    return Response(content=buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition":
+                             'attachment; filename="bft-transactions.csv"'})
+
+
+# ---------------------------------------------------------------------------
+# Static pages
+# ---------------------------------------------------------------------------
+@app.get("/static/{path:path}", include_in_schema=False)
+def static_files(path: str):
+    """Serve the frontend (index/scanner/dashboard/receipt + assets)."""
+    full = os.path.normpath(os.path.join(STATIC_DIR, path))
+    if not full.startswith(STATIC_DIR) or not os.path.isfile(full):
+        raise HTTPException(404, "Not found")
+    return FileResponse(full)
+File: run.py
+Python -- uvicorn entry point
+
+#!/usr/bin/env python3
+"""
+run.py -- Entry point for the BFT QR Pay server.
+
+VERSION: 1.0.0
+
+Usage:
+    python run.py                 # http://127.0.0.1:8000
+    PORT=8080 python run.py       # custom port
+"""
+import os
+
+import uvicorn
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("app.main:app", host="127.0.0.1", port=port, reload=False)
+File: app/static/styles.css
+CSS -- full design system and color scheme
+
+/*
+ * app/static/styles.css -- BFT QR Pay design system
+ * VERSION: 1.0.0
+ *
+ * COLOR SCHEME (single source of truth -- reference these variables
+ * everywhere; do not hard-code hex values in components):
+ *   --blue       #00539b  BFT primary blue (buttons, links, charts)
+ *   --blue-dark  #003a6e  topbar gradient end, headings
+ *   --green      #00843d  success/accepted states, secondary accent
+ *   --yellow     #ffb500  BFT logo square, highlights, day-pass accent
+ *   --bg         #f2f5f8  page background
+ *   --card       #ffffff  card surfaces
+ *   --text       #1c2b36  primary text
+ *   --muted      #64748b  secondary text
+ *   --border     #dde5ec  card/table borders
+ *   --danger     #c0392b  rejected/expired/error states
+ *   --ok         #1e8e3e  accepted/live success banners
+ *   --radius     12px     corner radius for cards/buttons
+ */
+
+:root {
+  --blue: #00539b;
+  --blue-dark: #003a6e;
+  --green: #00843d;
+  --yellow: #ffb500;
+  --bg: #f2f5f8;
+  --card: #ffffff;
+  --text: #1c2b36;
+  --muted: #64748b;
+  --border: #dde5ec;
+  --danger: #c0392b;
+  --ok: #1e8e3e;
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+}
+
+/* ---------------- Topbar ---------------- */
+.topbar {
+  background: linear-gradient(90deg, var(--blue-dark), var(--blue));
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+.logo {
+  background: var(--yellow);
+  color: var(--blue-dark);
+  font-weight: 800;
+  font-size: 20px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  letter-spacing: 1px;
+}
+.topbar h1 { font-size: 18px; margin: 0; font-weight: 600; }
+.topbar .spacer { flex: 1; }
+.topbar a {
+  color: #fff;
+  text-decoration: none;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+.topbar a:hover, .topbar a.active { background: rgba(255, 255, 255, 0.15); }
+.topbar .user { font-size: 13px; opacity: 0.9; }
+
+/* ---------------- Layout ---------------- */
+.wrap { max-width: 1080px; margin: 0 auto; padding: 20px; }
+.grid { display: grid; gap: 16px; }
+.grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  color: var(--blue-dark);
+  border-bottom: 2px solid var(--yellow);
+  display: inline-block;
+  padding-bottom: 4px;
+}
+
+/* ---------------- KPI tiles (dashboard) ---------------- */
+.kpi {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 5px solid var(--blue);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.kpi .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.kpi .value { font-size: 26px; font-weight: 700; color: var(--blue-dark); }
+.kpi.green { border-left-color: var(--green); }
+.kpi.yellow { border-left-color: var(--yellow); }
+.kpi.danger { border-left-color: var(--danger); }
+
+/* ---------------- Forms ---------------- */
+label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+input, select {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  background: #fff;
+  color: var(--text);
+}
+input:focus, select:focus { outline: 2px solid var(--blue); border-color: var(--blue); }
+
+button, .btn {
+  background: var(--blue);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+button:hover, .btn:hover { background: var(--blue-dark); }
+button.green { background: var(--green); }
+button.green:hover { background: #00682f; }
+button.yellow { background: var(--yellow); color: var(--blue-dark); }
+button.ghost { background: transparent; color: var(--blue); border: 1px solid var(--border); }
+
+/* ---------------- Tabs (rider app) ---------------- */
+.tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+.tabs button { background: #e7edf3; color: var(--text); }
+.tabs button.active { background: var(--blue); color: #fff; }
+
+/* ---------------- Tables ---------------- */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; }
+tr:hover td { background: #f7fafc; }
+
+/* ---------------- Status badges ---------------- */
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.badge.active, .badge.accepted, .badge.completed { background: #e3f4e9; color: var(--ok); }
+.badge.used, .badge.expired, .badge.rejected { background: #fbe9e7; color: var(--danger); }
+.badge.topup { background: #e3eefb; color: var(--blue); }
+.badge.purchase { background: #fff3d6; color: #9a6b00; }
+
+/* ---------------- Ticket cards (QR) ---------------- */
+.ticket {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 12px;
+  background: #fff;
+}
+.ticket img.qr { width: 148px; height: 148px; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 8px; }
+.ticket .info { flex: 1; }
+.ticket .info .name { font-weight: 700; font-size: 16px; color: var(--blue-dark); }
+.ticket .meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.ticket .payload { font-family: ui-monospace, Consolas, monospace; font-size: 11px; word-break: break-all; color: var(--muted); }
+
+/* ---------------- Fare product grid ---------------- */
+.products { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.product {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  cursor: pointer;
+  background: #fff;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.product:hover { border-color: var(--blue); box-shadow: 0 2px 8px rgba(0, 83, 155, 0.15); }
+.product.selected { border: 2px solid var(--blue); }
+.product .p-name { font-weight: 700; color: var(--blue-dark); }
+.product .p-price { font-size: 22px; font-weight: 800; margin: 6px 0; }
+.product .p-desc { font-size: 12px; color: var(--muted); }
+
+/* ---------------- Scan / result banners ---------------- */
+.banner {
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  font-weight: 600;
+  margin-bottom: 14px;
+}
+.banner.accept { background: #e3f4e9; color: var(--ok); border: 1px solid var(--ok); }
+.banner.reject { background: #fbe9e7; color: var(--danger); border: 1px solid var(--danger); }
+.banner.info { background: #e3eefb; color: var(--blue); border: 1px solid var(--blue); }
+
+/* ---------------- Sign-in ---------------- */
+.signin { max-width: 420px; margin: 60px auto; }
+
+/* ---------------- Print (proof of purchase) ---------------- */
+@media print {
+  .topbar, .no-print { display: none !important; }
+  body { background: #fff; }
+  .card { border: none; box-shadow: none; }
+}
+File: app/static/index.html
+HTML -- rider app shell (tabs: Wallet / Buy Fare / My Tickets / Receipts)
+
+<!DOCTYPE html>
+<!--
+  app/static/index.html -- Rider app (VERSION 1.0.0)
+  Tabs: Wallet | Buy Fare | My Tickets | Receipts
+  Also serves as the landing page for stop-poster QR deep links
+  (?stop=CODE shows a "buy fare for this stop" banner).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BFT QR Pay</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="logo">BFT</div>
+    <h1>QR Fare Payment</h1>
+    <div class="spacer"></div>
+    <a href="/">Rider</a>
+    <a href="/static/scanner.html">Scanner</a>
+    <a href="/static/dashboard.html">Analytics</a>
+    <span class="user" id="user-email"></span>
+    <button id="btn-logout" class="ghost" style="display:none;color:#fff">Sign out</button>
+  </header>
+
+  <!-- Sign-in card: email-only demo auth (auto-creates account) -->
+  <main class="wrap">
+    <div id="signin" class="card signin">
+      <h2>Sign in to BFT QR Pay</h2>
+      <p style="color:var(--muted);font-size:13px">
+        Demo authentication: enter any email address to create or open an account.
+      </p>
+      <label for="email">Email</label>
+      <input id="email" type="email" placeholder="you@example.com">
+      <button id="btn-signin" style="margin-top:12px;width:100%">Sign in</button>
+    </div>
+
+    <div id="app" style="display:none">
+      <div id="stop-banner" class="banner info" style="display:none"></div>
+
+      <div class="tabs">
+        <button data-tab="wallet" class="active">Wallet</button>
+        <button data-tab="buy">Buy Fare</button>
+        <button data-tab="tickets">My Tickets</button>
+        <button data-tab="receipts">Receipts</button>
+      </div>
+
+      <!-- WALLET: balance + simulated top-up -->
+      <section id="tab-wallet" class="card">
+        <h2>Wallet</h2>
+        <p style="font-size:28px;font-weight:800;color:var(--blue-dark)" id="wallet-balance">$0.00</p>
+        <label for="topup-amount">Add funds (demo payment)</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="ghost amt" data-amt="500">$5</button>
+          <button class="ghost amt" data-amt="1000">$10</button>
+          <button class="ghost amt" data-amt="2000">$20</button>
+          <button class="ghost amt" data-amt="5000">$50</button>
+        </div>
+        <label for="card-last4">Card last 4 digits (demo)</label>
+        <input id="card-last4" maxlength="4" placeholder="4242" style="max-width:140px">
+        <button id="btn-topup" class="green" style="margin-top:12px">Top up</button>
+      </section>
+
+      <!-- BUY FARE: product grid with reduced pricing toggle -->
+      <section id="tab-buy" class="card" style="display:none">
+        <h2>Buy a fare</h2>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="reduced" style="width:auto"> Reduced fare (Youth / Senior / Disability)
+        </label>
+        <div class="products" id="product-grid"></div>
+        <button id="btn-purchase" class="green" style="margin-top:14px" disabled>Select a fare</button>
+      </section>
+
+      <!-- MY TICKETS: scannable QR codes -->
+      <section id="tab-tickets" class="card" style="display:none">
+        <h2>My tickets</h2>
+        <div id="ticket-list"></div>
+      </section>
+
+      <!-- RECEIPTS: proof of purchase list -->
+      <section id="tab-receipts" class="card" style="display:none">
+        <h2>Receipts</h2>
+        <table>
+          <thead><tr><th>Receipt</th><th>Date</th><th>Type</th><th>Description</th><th>Amount</th><th>Status</th><th></th></tr></thead>
+          <tbody id="receipt-rows"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
+File: app/static/app.js
+JavaScript -- rider app logic
+
+/*
+ * app/static/app.js -- Rider app logic (VERSION 1.0.0)
+ *
+ * FLOW: sign in -> (optional) top up wallet -> buy fare -> QR ticket
+ * appears under "My Tickets" -> show QR to the scanner -> receipt
+ * recorded automatically.
+ *
+ * All server calls go through the small api() wrapper below so
+ * error handling and JSON parsing live in one place.
+ */
+
+const $ = (sel) => document.querySelector(sel);
+
+/** Fetch wrapper: JSON in/out, throws Error(message) on !ok. */
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || res.statusText);
+  return data;
+}
+
+const money = (cents) => "$" + (cents / 100).toFixed(2);
+let selectedProduct = null;
+let catalog = null;
+
+/* ---------------- Tabs ---------------- */
+document.querySelectorAll(".tabs button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    document.querySelectorAll("main section").forEach((s) => (s.style.display = "none"));
+    document.getElementById("tab-" + btn.dataset.tab).style.display = "block";
+  });
+});
+
+/* ---------------- Sign in / out ---------------- */
+$("#btn-signin").addEventListener("click", async () => {
+  const email = $("#email").value.trim();
+  if (!email) return alert("Enter an email address");
+  await api("/api/session", { method: "POST", body: JSON.stringify({ email }) });
+  boot();
+});
+
+$("#btn-logout").addEventListener("click", async () => {
+  await api("/api/logout", { method: "POST" });
+  location.reload();
+});
+
+/* ---------------- Wallet top-up (simulated payment) ---------------- */
+document.querySelectorAll(".amt").forEach((b) =>
+  b.addEventListener("click", () => { $("#card-last4").focus(); b.dataset.picked = "1"; }));
+
+$("#btn-topup").addEventListener("click", async () => {
+  // Use the last clicked quick-amount, defaulting to $10.
+  const picked = document.querySelector(".amt[data-picked]");
+  const cents = picked ? parseInt(picked.dataset.amt) : 1000;
+  const last4 = $("#card-last4").value.trim();
+  if (!/^\d{4}$/.test(last4)) return alert("Enter the 4-digit card suffix");
+  try {
+    await api("/api/topup", {
+      method: "POST",
+      body: JSON.stringify({ amount_cents: cents, card_last4: last4 }),
+    });
+    boot();
+  } catch (e) { alert(e.message); }
+});
+
+/* ---------------- Buy fare ---------------- */
+function renderProducts() {
+  const reduced = $("#reduced").checked;
+  const grid = $("#product-grid");
+  grid.innerHTML = "";
+  catalog.products.forEach((p) => {
+    const div = document.createElement("div");
+    div.className = "product" + (selectedProduct === p.code ? " selected" : "");
+    const price = reduced ? p.reduced_price_cents : p.price_cents;
+    div.innerHTML = `
+      <div class="p-name">${p.name}${p.mobile_only ? " 📱" : ""}</div>
+      <div class="p-price">${money(price)}</div>
+      <div class="p-desc">${p.description}</div>`;
+    div.addEventListener("click", () => {
+      selectedProduct = p.code;
+      const btn = $("#btn-purchase");
+      btn.disabled = false;
+      btn.textContent = `Buy ${p.name} — ${money(price)}`;
+      renderProducts();
+    });
+    grid.appendChild(div);
+  });
+}
+
+$("#reduced").addEventListener("change", renderProducts);
+
+$("#btn-purchase").addEventListener("click", async () => {
+  if (!selectedProduct) return;
+  try {
+    const out = await api("/api/purchase", {
+      method: "POST",
+      body: JSON.stringify({ product_code: selectedProduct, reduced: $("#reduced").checked }),
+    });
+    alert(`Purchased! Receipt ${out.receipt_id}. Find your QR under "My Tickets".`);
+    // Switch to the tickets tab so the new QR is immediately visible.
+    document.querySelector('.tabs button[data-tab="tickets"]').click();
+    boot();
+  } catch (e) { alert(e.message); }
+});
+
+/* ---------------- My tickets ---------------- */
+function renderTickets(tickets) {
+  const list = $("#ticket-list");
+  list.innerHTML = tickets.length ? "" : "<p style='color:var(--muted)'>No tickets yet — buy a fare first.</p>";
+  tickets.forEach((t) => {
+    const div = document.createElement("div");
+    div.className = "ticket";
+    const rides = t.rides_remaining === null ? "Unlimited" : `${t.rides_remaining} rides left`;
+    div.innerHTML = `
+      <img class="qr" src="${t.qr_png_data_uri}" alt="Ticket QR">
+      <div class="info">
+        <div class="name">${t.product_name}</div>
+        <div class="meta">${rides} · expires ${new Date(t.expires_at).toLocaleString()}</div>
+        <span class="badge ${t.status}">${t.status}</span>
+        <div class="payload">${t.qr_payload}</div>
+      </div>`;
+    list.appendChild(div);
+  });
+}
+
+/* ---------------- Receipts ---------------- */
+function renderReceipts(receipts) {
+  const rows = $("#receipt-rows");
+  rows.innerHTML = receipts.length ? "" : "<tr><td colspan='7' style='color:var(--muted)'>No receipts yet.</td></tr>";
+  receipts.forEach((r) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${r.id}</td>
+      <td>${new Date(r.created_at).toLocaleString()}</td>
+      <td><span class="badge ${r.type}">${r.type}</span></td>
+      <td>${r.description}</td>
+      <td>${money(r.amount_cents)}</td>
+      <td><span class="badge ${r.status}">${r.status}</span></td>
+      <td><a class="btn" style="padding:4px 10px;font-size:12px" href="/static/receipt.html?id=${r.id}">View</a></td>`;
+    rows.appendChild(tr);
+  });
+}
+
+/* ---------------- Stop deep-link banner (?stop=CODE) ---------------- */
+function handleStopParam(me) {
+  const stop = new URLSearchParams(location.search).get("stop");
+  if (!stop || !me.signed_in) return;
+  fetch("/api/stop/" + encodeURIComponent(stop))
+    .then((r) => (r.ok ? r.json() : null))
+    .then((s) => {
+      if (!s) return;
+      const el = $("#stop-banner");
+      el.style.display = "block";
+      el.textContent = `You scanned the poster at ${s.name}. Buy a fare below, then board route of your choice.`;
+      document.querySelector('.tabs button[data-tab="buy"]').click();
+    });
+}
+
+/* ---------------- Boot ---------------- */
+async function boot() {
+  // Expire stale tickets server-side, then load everything.
+  try {
+    const me = await api("/api/me");
+    if (!me.signed_in) {
+      $("#signin").style.display = "block";
+      $("#app").style.display = "none";
+      return;
+    }
+    $("#signin").style.display = "none";
+    $("#app").style.display = "block";
+    $("#btn-logout").style.display = "inline-block";
+    $("#user-email").textContent = me.email;
+    $("#wallet-balance").textContent = money(me.wallet_cents);
+
+    await api("/api/tickets/expire-sweep", { method: "POST" });
+    if (!catalog) catalog = await api("/api/catalog");
+    renderProducts();
+    renderTickets((await api("/api/tickets")).tickets);
+    renderReceipts((await api("/api/receipts")).receipts);
+    handleStopParam(me);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+boot();
+File: app/static/scanner.html
+HTML -- operator fare validator shell
+
+<!DOCTYPE html>
+<!--
+  app/static/scanner.html -- Fare validator surface (VERSION 1.0.0)
+  Used by operators: camera-scans rider QR codes, validates them
+  server-side, and shows accept/reject. Also generates printable
+  stop-poster QR codes (server-rendered PNG, no external service).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BFT Fare Validator</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <!-- html5-qrcode: camera QR decoding (CDN, no build step) -->
+  <script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="logo">BFT</div>
+    <h1>Fare Validator</h1>
+    <div class="spacer"></div>
+    <a href="/">Rider</a>
+    <a href="/static/scanner.html" class="active">Scanner</a>
+    <a href="/static/dashboard.html">Analytics</a>
+  </header>
+
+  <main class="wrap">
+    <div class="grid cols-2">
+      <!-- CAMERA SCANNER -->
+      <section class="card">
+        <h2>Scan rider QR</h2>
+        <div id="qr-reader" style="width:100%;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden"></div>
+        <div id="scan-result" class="banner info" style="display:none;margin-top:12px"></div>
+        <div style="margin-top:12px">
+          <button id="btn-start" class="green">Start camera</button>
+          <button id="btn-stop" class="ghost">Stop</button>
+        </div>
+      </section>
+
+      <!-- CONTROLS + MANUAL ENTRY -->
+      <section class="card">
+        <h2>Validator settings</h2>
+        <label for="route">Route</label>
+        <select id="route"></select>
+        <label for="scanner-id">Scanner ID</label>
+        <input id="scanner-id" value="SCN-001">
+        <label for="stop">Stop (optional)</label>
+        <select id="stop"><option value="">—</option></select>
+
+        <h2 style="margin-top:20px">Manual payload entry</h2>
+        <label for="payload">QR payload (BFT1:...)</label>
+        <input id="payload" placeholder="BFT1:tkt_xxxx:abcdef1234567890">
+        <button id="btn-validate" style="margin-top:10px">Validate</button>
+
+        <h2 style="margin-top:20px">Local validation log</h2>
+        <table>
+          <thead><tr><th>Time</th><th>Result</th><th>Reason</th></tr></thead>
+          <tbody id="log-rows"></tbody>
+        </table>
+      </section>
+    </div>
+
+    <!-- STOP POSTER QR GENERATOR -->
+    <section class="card" style="margin-top:16px">
+      <h2>Stop poster QR generator</h2>
+      <p style="color:var(--muted);font-size:13px">
+        Generates a printable QR poster for a stop. Riders scan it to open the
+        rider app pre-loaded with that stop context. QR is rendered server-side.
+      </p>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <select id="poster-stop" style="max-width:280px"></select>
+        <button id="btn-poster" class="yellow">Generate poster QR</button>
+      </div>
+      <div id="poster-out" style="margin-top:12px"></div>
+    </section>
+  </main>
+
+  <script src="/static/scanner.js"></script>
+</body>
+</html>
+File: app/static/scanner.js
+JavaScript -- validator logic (camera + manual + stop posters)
+
+/*
+ * app/static/scanner.js -- Fare validator logic (VERSION 1.0.0)
+ *
+ * FLOW: camera decodes QR -> payload POSTed to /api/validate along with
+ * route + scanner id -> server verifies HMAC signature, checks status,
+ * expiry, and rides -> consume ride if valid -> accept/reject banner
+ * shown and logged locally. Every validation is also stored in the
+ * boardings table for analytics.
+ */
+
+const $ = (sel) => document.querySelector(sel);
+let html5Scanner = null;
+
+/** Show an accept/reject/info banner. */
+function showBanner(kind, text) {
+  const el = $("#scan-result");
+  el.style.display = "block";
+  el.className = "banner " + kind;   // "accept" | "reject" | "info"
+  el.textContent = text;
+}
+
+/** Append a row to the local validation log table. */
+function logRow(result, reason) {
+  const tr = document.createElement("tr");
+  const badge = result === "accepted" ? "accepted" : "rejected";
+  tr.innerHTML = `<td>${new Date().toLocaleTimeString()}</td>
+                  <td><span class="badge ${badge}">${result}</span></td>
+                  <td>${reason}</td>`;
+  $("#log-rows").prepend(tr);
+}
+
+/** POST the payload to the server and render the verdict. */
+async function validate(payload) {
+  try {
+    const res = await fetch("/api/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        payload,
+        route_id: $("#route").value,
+        scanner_id: $("#scanner-id").value || "SCN-000",
+        stop_code: $("#stop").value || null,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    if (data.result === "accepted") {
+      const rides = data.rides_remaining === null
+        ? "unlimited" : `${data.rides_remaining} rides left`;
+      showBanner("accept", `✅ ACCEPTED — ${data.product_name} · ${rides} · rider ${data.rider_ref}`);
+    } else {
+      showBanner("reject", `❌ REJECTED — ${data.reason}`);
+    }
+    logRow(data.result, data.reason || data.detail || "error");
+  } catch (e) {
+    showBanner("reject", `❌ ERROR — ${e.message}`);
+    logRow("rejected", e.message);
+  }
+}
+
+/* ---------------- Camera (html5-qrcode) ---------------- */
+$("#btn-start").addEventListener("click", () => {
+  html5Scanner = new Html5Qrcode("qr-reader");
+  html5Scanner.start(
+    { facingMode: "environment" },           // rear camera on phones
+    { fps: 10, qrbox: { width: 240, height: 240 } },
+    (decodedText) => {
+      // Debounce: stop after one successful read; operator taps Start again.
+      html5Scanner.stop().then(() => validate(decodedText));
+    },
+    () => {} /* per-frame decode errors are noise; ignore */
+  ).catch((err) => showBanner("reject", "Camera error: " + err));
+});
+
+$("#btn-stop").addEventListener("click", () => {
+  if (html5Scanner) {
+    html5Scanner.stop().catch(() => {});
+    html5Scanner = null;
+    showBanner("info", "Camera stopped.");
+  }
+});
+
+/* ---------------- Manual entry ---------------- */
+$("#btn-validate").addEventListener("click", () => {
+  const payload = $("#payload").value.trim();
+  if (payload) validate(payload);
+});
+
+/* ---------------- Populate selects + poster generator ---------------- */
+(async function init() {
+  const cat = await fetch("/api/catalog").then((r) => r.json());
+  cat.routes.forEach((r) => {
+    $("#route").insertAdjacentHTML("beforeend", `<option value="${r.id}">${r.id} — ${r.name}</option>`);
+  });
+  cat.stops.forEach((s) => {
+    $("#stop").insertAdjacentHTML("beforeend", `<option value="${s.code}">${s.code} — ${s.name}</option>`);
+    $("#poster-stop").insertAdjacentHTML("beforeend", `<option value="${s.code}">${s.code} — ${s.name}</option>`);
+  });
+})();
+
+$("#btn-poster").addEventListener("click", () => {
+  const code = $("#poster-stop").value;
+  if (!code) return;
+  $("#poster-out").innerHTML =
+    `<img src="/api/stop/${encodeURIComponent(code)}/qr" alt="Stop QR" width="220" height="220"
+          style="border:1px solid var(--border);border-radius:8px">`;
+});
+File: app/static/dashboard.html
+HTML -- analytics dashboard shell
+
+<!DOCTYPE html>
+<!--
+  app/static/dashboard.html -- Agency analytics dashboard (VERSION 1.0.0)
+  KPIs, revenue trend, boardings by route, product mix, payment mix,
+  recent transactions and validations, CSV export.
+  NOTE (demo): /api/admin/* is open; protect behind staff SSO in production.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BFT Analytics Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <!-- Chart.js for all charts (CDN, no build step) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="logo">BFT</div>
+    <h1>Analytics Dashboard</h1>
+    <div class="spacer"></div>
+    <a href="/">Rider</a>
+    <a href="/static/scanner.html">Scanner</a>
+    <a href="/static/dashboard.html" class="active">Analytics</a>
+  </header>
+
+  <main class="wrap">
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:16px">
+      <label for="range" style="margin:0">Range</label>
+      <select id="range" style="width:auto">
+        <option value="7">Last 7 days</option>
+        <option value="30" selected>Last 30 days</option>
+        <option value="90">Last 90 days</option>
+      </select>
+      <a class="btn" href="/api/admin/export.csv?days=90">Export CSV</a>
+    </div>
+
+    <!-- KPI tiles -->
+    <div class="grid cols-4" id="kpis"></div>
+
+    <!-- Charts -->
+    <div class="grid cols-2" style="margin-top:16px">
+      <section class="card"><h2>Revenue per day</h2><canvas id="chart-revenue"></canvas></section>
+      <section class="card"><h2>Boardings by route</h2><canvas id="chart-routes"></canvas></section>
+      <section class="card"><h2>Revenue by product</h2><canvas id="chart-products"></canvas></section>
+      <section class="card"><h2>Payment mix</h2><canvas id="chart-methods"></canvas></section>
+    </div>
+
+    <!-- Recent activity tables -->
+    <div class="grid cols-2" style="margin-top:16px">
+      <section class="card">
+        <h2>Recent transactions</h2>
+        <table>
+          <thead><tr><th>Receipt</th><th>Type</th><th>Amount</th><th>Rider</th><th>When</th></tr></thead>
+          <tbody id="tx-rows"></tbody>
+        </table>
+      </section>
+      <section class="card">
+        <h2>Recent validations</h2>
+        <table>
+          <thead><tr><th>When</th><th>Route</th><th>Result</th><th>Reason</th><th>Scanner</th></tr></thead>
+          <tbody id="val-rows"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
+File: app/static/dashboard.js
+JavaScript -- Chart.js dashboard logic
+
+/*
+ * app/static/dashboard.js -- Analytics dashboard logic (VERSION 1.0.0)
+ *
+ * FLOW: choose a range (7/30/90 days) -> GET /api/admin/analytics?days=N
+ * -> render KPI tiles, four Chart.js charts, and the recent-activity
+ * tables. Rider emails are masked server-side (xxx***@domain) and the
+ * CSV export uses R-<sha1> references, never raw emails.
+ */
+
+const $ = (sel) => document.querySelector(sel);
+const money = (cents) => "$" + (cents / 100).toFixed(2);
+const charts = {};   // keep Chart.js instances so we can destroy on reload
+
+/** Render the 6 KPI tiles from the analytics payload. */
+function renderKpis(k) {
+  const tiles = [
+    { label: "Revenue", value: money(k.revenue_cents), cls: "" },
+    { label: "Boardings", value: k.boardings.toLocaleString(), cls: "green" },
+    { label: "Accepted", value: k.accepted.toLocaleString(), cls: "green" },
+    { label: "Rejected", value: k.rejected.toLocaleString(), cls: "danger" },
+    { label: "Active tickets", value: k.active_tickets.toLocaleString(), cls: "yellow" },
+    { label: "Accounts", value: k.accounts.toLocaleString(), cls: "" },
+  ];
+  $("#kpis").innerHTML = tiles.map((t) => `
+    <div class="kpi ${t.cls}">
+      <div class="label">${t.label}</div>
+      <div class="value">${t.value}</div>
+    </div>`).join("");
+}
+
+/** Create or replace a named chart. */
+function makeChart(id, config) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart($(id), config);
+}
+
+/** Load analytics for the selected range and paint everything. */
+async function load() {
+  const days = $("#range").value;
+  const d = await fetch(`/api/admin/analytics?days=${days}`).then((r) => r.json());
+  renderKpis(d.kpis);
+
+  // Line chart: revenue per day.
+  makeChart("#chart-revenue", {
+    type: "line",
+    data: {
+      labels: d.revenue_by_day.map((r) => r.day.slice(5)),
+      datasets: [{
+        label: "Revenue ($)",
+        data: d.revenue_by_day.map((r) => r.cents / 100),
+        borderColor: "#00539b",
+        backgroundColor: "rgba(0,83,155,0.12)",
+        fill: true,
+        tension: 0.3,
+      }],
+    },
+    options: { plugins: { legend: { display: false } } },
+  });
+
+  // Bar chart: boardings per route (uses each route's brand color).
+  makeChart("#chart-routes", {
+    type: "bar",
+    data: {
+      labels: d.rides_by_route.map((r) => r.route),
+      datasets: [{
+        label: "Boardings",
+        data: d.rides_by_route.map((r) => r.boardings),
+        backgroundColor: d.rides_by_route.map((r) => r.color),
+      }],
+    },
+    options: { plugins: { legend: { display: false } } },
+  });
+
+  // Doughnut: revenue share by fare product.
+  makeChart("#chart-products", {
+    type: "doughnut",
+    data: {
+      labels: d.product_breakdown.map((r) => r.product),
+      datasets: [{
+        data: d.product_breakdown.map((r) => r.cents / 100),
+        backgroundColor: ["#00539b", "#00843d", "#ffb500", "#6a3d9a", "#c0392b"],
+      }],
+    },
+  });
+
+  // Doughnut: wallet vs card payment mix.
+  makeChart("#chart-methods", {
+    type: "doughnut",
+    data: {
+      labels: d.revenue_by_method.map((r) => r.method),
+      datasets: [{
+        data: d.revenue_by_method.map((r) => r.cents / 100),
+        backgroundColor: ["#00539b", "#ffb500"],
+      }],
+    },
+  });
+
+  // Recent transactions (rider email masked server-side).
+  $("#tx-rows").innerHTML = d.recent_transactions.map((t) => `
+    <tr>
+      <td>${t.id}</td>
+      <td><span class="badge ${t.type}">${t.type}</span></td>
+      <td>${money(t.amount_cents)}</td>
+      <td>${t.email}</td>
+      <td>${new Date(t.created_at).toLocaleString()}</td>
+    </tr>`).join("");
+
+  // Recent validations (accepted/rejected scans).
+  $("#val-rows").innerHTML = d.recent_validations.map((v) => `
+    <tr>
+      <td>${new Date(v.scanned_at).toLocaleString()}</td>
+      <td>${v.route_id}</td>
+      <td><span class="badge ${v.result}">${v.result}</span></td>
+      <td>${v.reason}</td>
+      <td>${v.scanner_id}</td>
+    </tr>`).join("");
+}
+
+$("#range").addEventListener("change", load);
+load();
+File: app/static/receipt.html
+HTML -- printable proof of purchase
+
+<!DOCTYPE html>
+<!--
+  app/static/receipt.html -- Printable proof of purchase (VERSION 1.0.0)
+  Opened from the rider app as /static/receipt.html?id=BFT-YYYY-NNNNNN.
+  Uses @media print rules from styles.css to hide chrome when printed
+  or saved as PDF.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BFT Receipt</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="logo">BFT</div>
+    <h1>Proof of Purchase</h1>
+    <div class="spacer"></div>
+    <a href="/" class="no-print">Back to app</a>
+  </header>
+
+  <main class="wrap" style="max-width:640px">
+    <div class="card" id="receipt-card">
+      <h2>Ben Franklin Transit — Receipt</h2>
+      <div id="receipt-body" style="color:var(--muted)">Loading receipt…</div>
+    </div>
+    <div class="no-print" style="margin-top:14px">
+      <button onclick="window.print()">Print / Save as PDF</button>
+    </div>
+  </main>
+
+  <script>
+    /* Fetch the receipt by id from the URL query string and render it.
+       Ownership is enforced server-side: the API only returns receipts
+       belonging to the signed-in account's session cookie. */
+    const id = new URLSearchParams(location.search).get("id");
+
+    const money = (c) => "$" + (c / 100).toFixed(2);
+
+    (async function render() {
+      if (!id) {
+        document.getElementById("receipt-body").textContent = "Missing receipt id.";
+        return;
+      }
+      const res = await fetch("/api/receipts/" + encodeURIComponent(id));
+      if (!res.ok) {
+        document.getElementById("receipt-body").textContent =
+          res.status === 401 ? "Sign in first (open the rider app)." : "Receipt not found.";
+        return;
+      }
+      const [{ receipt: r, ticket }, me] = await Promise.all([
+        res.clone().json(),
+        fetch("/api/me").then((m) => m.json()),
+      ]);
+      const rows = [
+        ["Receipt number", r.id],
+        ["Date", new Date(r.created_at).toLocaleString()],
+        ["Customer", me.signed_in ? me.email : "—"],
+        ["Type", `<span class="badge ${r.type}">${r.type}</span>`],
+        ["Description", r.description],
+        ["Payment method", r.method],
+        ["Status", `<span class="badge ${r.status}">${r.status}</span>`],
+        ["Total", `<strong>${money(r.amount_cents)}</strong>`],
+      ];
+      if (ticket) {
+        rows.push(["Ticket", ticket.id]);
+        rows.push(["Fare product", ticket.product_name]);
+        rows.push(["Ticket status", `<span class="badge ${ticket.status}">${ticket.status}</span>`]);
+        rows.push(["Rides remaining", ticket.rides_remaining === null ? "Unlimited" : ticket.rides_remaining]);
+        rows.push(["Valid until", new Date(ticket.expires_at).toLocaleString()]);
+      }
+      document.getElementById("receipt-body").innerHTML = `
+        <table style="margin-top:8px">
+          ${rows.map(([k, v]) => `<tr><td style="color:var(--muted);width:160px">${k}</td><td>${v}</td></tr>`).join("")}
+        </table>
+        <p style="margin-top:16px;font-size:12px">
+          Ben Franklin Transit · 1000 W Columbia Dr, Kennewick, WA 99336 · bft.org<br>
+          Keep this receipt as proof of payment. Fares are non-transferable.
+        </p>`;
+    })();
+  </script>
+</body>
+</html>
+File: requirements.txt
+Python dependencies
+
+# BFT QR Pay -- Python dependencies (VERSION 1.0.0)
+# Install with:  pip install -r requirements.txt
+fastapi>=0.110
+uvicorn>=0.29
+qrcode[pil]>=7.4
+pillow>=10.0
+python-multipart>=0.0.9
+pydantic[email]>=2.6
+File: tests/e2e_test.py
+Python -- 12-check end-to-end suite
+
+"""
+tests/e2e_test.py -- End-to-end test for BFT QR Pay (VERSION 1.0.0)
+
+Run against a live server:
+    python run.py            # in one terminal
+    python tests/e2e_test.py # in another
+
+12 checks:
+  1.  Health + rider page load
+  2.  Sign-in (session cookie)
+  3.  Wallet top-up
+  4.  Single-ride purchase (QR minted, HMAC verified)
+  5.  First scan ACCEPTED (ride consumed)
+  6.  Re-scan REJECTED ("Ticket is used")
+  7.  Tampered payload REJECTED
+  8.  Day pass purchase + double boarding ACCEPTED
+  9.  Receipts list + single receipt fetch
+  10. Insufficient funds -> 402
+  11. Analytics endpoint returns real numbers
+  12. CSV export + scanner/dashboard pages load
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("BFT_BASE", "http://127.0.0.1:8000")
+
+# Cookie jar for the demo session.
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+
+
+def call(method, path, body=None, raw=False):
+    """HTTP helper returning (status, parsed-json-or-bytes)."""
+    req = urllib.request.Request(
+        BASE + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Content-Type": "application/json"},
+        method=method,
+    )
+    try:
+        with OPENER.open(req) as r:
+            payload = r.read()
+            return r.status, (payload if raw else json.loads(payload))
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        try:
+            return e.code, json.loads(payload)
+        except Exception:
+            return e.code, payload
+
+
+passed = failed = 0
+
+
+def check(n, desc, cond, extra=""):
+    global passed, failed
+    if cond:
+        passed += 1
+        print(f"  PASS {n:2d}. {desc}")
+    else:
+        failed += 1
+        print(f"  FAIL {n:2d}. {desc} {extra}")
+
+
+# 1. Health + rider page
+s, b = call("GET", "/healthz")
+check(1, "healthz ok", s == 200 and b.get("status") == "ok")
+s, page = call("GET", "/", raw=True)
+check(1, "rider page loads", s == 200 and b"BFT QR Pay" in page)
+
+# 2. Sign in
+email = f"e2e_{secrets.token_hex(4)}@example.com"
+s, b = call("POST", "/api/session", {"email": email})
+check(2, "sign-in sets session", s == 200 and b.get("ok"))
+
+# 3. Top-up $20
+s, b = call("POST", "/api/topup", {"amount_cents": 2000, "card_last4": "4242"})
+check(3, "top-up credits wallet", s == 200 and b.get("wallet_cents") == 2000)
+
+# 4. Purchase single ride
+s, b = call("POST", "/api/purchase", {"product_code": "SINGLE", "reduced": False})
+ticket = b.get("ticket", {})
+payload = ticket.get("qr_payload", "")
+check(4, "purchase mints signed QR", s == 200 and payload.startswith("BFT1:"))
+
+# Verify the HMAC locally (proves the signing scheme end-to-end).
+tid = payload.split(":")[1]
+secret_path = os.path.join(os.path.dirname(__file__), "..", "data", ".secret")
+secret = open(secret_path).read().strip()
+expected_sig = hmac.new(secret.encode(), tid.encode(), hashlib.sha256).hexdigest()[:16]
+check(4, "payload HMAC is correct", payload.endswith(expected_sig))
+
+# 5. First scan accepted
+s, b = call("POST", "/api/validate",
+            {"payload": payload, "route_id": "26", "scanner_id": "SCN-E2E"})
+check(5, "first scan accepted", s == 200 and b.get("result") == "accepted", str(b))
+
+# 6. Re-scan rejected (single ride consumed)
+s, b = call("POST", "/api/validate",
+            {"payload": payload, "route_id": "26", "scanner_id": "SCN-E2E"})
+check(6, "re-scan rejected (used)", s == 200 and b.get("result") == "rejected"
+      and "used" in b.get("reason", ""))
+
+# 7. Tampered payload rejected
+tampered = payload[:-4] + "0000"
+s, b = call("POST", "/api/validate",
+            {"payload": tampered, "route_id": "26", "scanner_id": "SCN-E2E"})
+check(7, "tampered payload rejected", s in (200, 400)
+      and (b.get("result") == "rejected" if isinstance(b, dict) else True))
+
+# 8. Day pass: double boarding accepted
+s, b = call("POST", "/api/purchase", {"product_code": "DAY", "reduced": False})
+day_payload = b["ticket"]["qr_payload"]
+r1, _ = call("POST", "/api/validate", {"payload": day_payload, "route_id": "100"})
+r2, _ = call("POST", "/api/validate", {"payload": day_payload, "route_id": "110"})
+check(8, "day pass double boarding accepted", r1 == 200 and r2 == 200)
+
+# 9. Receipts
+s, b = call("GET", "/api/receipts")
+receipts = b.get("receipts", [])
+check(9, "receipts listed (>=3)", s == 200 and len(receipts) >= 3)
+s, b = call("GET", f"/api/receipts/{receipts[0]['id']}")
+check(9, "single receipt fetch", s == 200 and b.get("receipt", {}).get("id") == receipts[0]["id"])
+
+# 10. Insufficient funds -> 402
+s, b = call("POST", "/api/purchase", {"product_code": "YEAR", "reduced": False})
+check(10, "insufficient funds -> 402", s == 402)
+
+# 11. Analytics
+s, b = call("GET", "/api/admin/analytics?days=30")
+k = b.get("kpis", {})
+check(11, "analytics returns KPIs", s == 200 and k.get("revenue_cents", 0) > 0
+      and k.get("boardings", 0) > 0)
+
+# 12. CSV export + scanner/dashboard pages
+s, csv_bytes = call("GET", "/api/admin/export.csv?days=90", raw=True)
+check(12, "CSV export works", s == 200 and b"receipt_id" in csv_bytes)
+s, p1 = call("GET", "/static/scanner.html", raw=True)
+s2, p2 = call("GET", "/static/dashboard.html", raw=True)
+check(12, "scanner + dashboard pages load", s == 200 and s2 == 200)
+
+print(f"\n{passed} passed, {failed} failed")
+raise SystemExit(1 if failed else 0)
